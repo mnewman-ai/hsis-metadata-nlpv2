@@ -17,7 +17,12 @@ from pydantic import BaseModel
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 CACHE_FILE = PROJECT_ROOT / "data" / "cache" / "llm_normalizations.json"
 PROMPT_VERSION = "1.0"
-DEFAULT_MODEL = "gpt-4o-mini"
+DEFAULT_MODELS = {
+    "gemini": "gemini-3.8-flash",
+    "openai": "gpt-4o-mini",
+}
+
+VALID_PROVIDERS = ("gemini", "openai")
 
 ACRONYM_LOOKUP = {
     "AADT": "annual average daily traffic",
@@ -89,7 +94,8 @@ def build_cache_key(
     variable_name: str,
     description: str,
     field_type: str,
-    use_llm: bool,
+    provider: str,
+    model: str,
 ) -> str:
     """Create a stable key so only changed fields cause a new API call."""
     source = {
@@ -98,12 +104,12 @@ def build_cache_key(
         "variable_name": clean_text(variable_name),
         "description": clean_text(description),
         "field_type": clean_text(field_type),
-        "normalization_mode": "openai" if use_llm else "offline",
+        "normalization_mode": provider,
+        "model": model,
     }
 
     serialized = json.dumps(source, sort_keys=True)
     return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
-
 
 def offline_normalization(
     variable_name: str,
@@ -171,11 +177,7 @@ def normalize_metadata(
                 "or run the engine with --offline."
             )
 
-        model_name = os.environ.get("ARTN_MODEL")
-        if not model_name:
-            raise RuntimeError(
-                "ARTN_MODEL is not set. Add it as a Codespaces secret."
-            )
+        model_name = os.environ.get("OPENAI_MODEL", DEFAULT_MODEL)
         base_url = os.environ.get("ARTN_BASE_URL")
         if not base_url:
             raise RuntimeError(
@@ -187,11 +189,11 @@ def normalize_metadata(
             base_url=base_url,
         )
 
-        system_prompt = """
+SYSTEM_PROMPT = """
 You are an expert Transportation Data Architecture Engine.
 
 Normalize one raw state DOT data-dictionary field for semantic matching
-against a national highway-safety master schema.
+against fields from other states' highway-safety data dictionaries.
 
 Return only JSON with exactly these keys:
 - standard_name
@@ -206,7 +208,9 @@ Rules:
 - Keep descriptions concise and factual.
 """.strip()
 
-        user_prompt = f"""
+
+def build_user_prompt(state, variable_name, description, field_type) -> str:
+    return f"""
 State: {clean_text(state)}
 Raw variable name: {clean_text(variable_name)}
 Known abbreviation expansion: {expand_acronyms(variable_name)}
@@ -214,20 +218,105 @@ Source description: {clean_text(description)}
 Field type: {clean_text(field_type)}
 """.strip()
 
-        response = client.beta.chat.completions.parse(
-            model=model_name,
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt},
-            ],
-            response_format=NormalizedMetadata,
+
+def get_model_name(provider: str) -> str:
+    """Model comes from <PROVIDER>_MODEL if set, else the default."""
+    return os.environ.get(f"{provider.upper()}_MODEL", DEFAULT_MODELS[provider])
+
+
+def call_gemini(user_prompt: str, model_name: str) -> NormalizedMetadata:
+    from google import genai
+    from google.genai import types
+
+    api_key = os.environ.get("GEMINI_API_KEY")
+    if not api_key:
+        raise RuntimeError("GEMINI_API_KEY is not set.")
+
+    client = genai.Client(api_key=api_key)
+    response = client.models.generate_content(
+        model=model_name,
+        contents=user_prompt,
+        config=types.GenerateContentConfig(
+            system_instruction=SYSTEM_PROMPT,
+            response_mime_type="application/json",
+            response_schema=NormalizedMetadata,
+        ),
+    )
+
+    if response.parsed is not None:
+        return response.parsed
+    return NormalizedMetadata.model_validate_json(response.text)
+
+
+def call_openai(user_prompt: str, model_name: str) -> NormalizedMetadata:
+    api_key = os.environ.get("OPENAI_API_KEY")
+    if not api_key:
+        raise RuntimeError("OPENAI_API_KEY is not set.")
+
+    # Optional: only needed for a custom gateway. None = standard OpenAI.
+    base_url = os.environ.get("OPENAI_BASE_URL") or None
+
+    client = OpenAI(api_key=api_key, base_url=base_url)
+    response = client.beta.chat.completions.parse(
+        model=model_name,
+        messages=[
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": user_prompt},
+        ],
+        response_format=NormalizedMetadata,
+    )
+
+    normalized = response.choices[0].message.parsed
+    if normalized is None:
+        raise RuntimeError("OpenAI returned no structured normalization.")
+    return normalized
+
+
+def normalize_metadata(
+    state: str,
+    variable_name: str,
+    description: str,
+    field_type: str,
+    use_llm: bool = True,
+    llm_provider: str = "gemini",
+) -> tuple[NormalizedMetadata, str, bool]:
+    """
+    Normalize one state metadata field.
+
+    Returns (normalized_metadata, normalization_source, cache_hit).
+    normalization_source is "gemini", "openai", or "offline_fallback".
+    """
+    if use_llm and llm_provider not in VALID_PROVIDERS:
+        raise ValueError(
+            f"llm_provider must be one of {VALID_PROVIDERS}, got {llm_provider!r}"
         )
 
-        normalized = response.choices[0].message.parsed
-        if normalized is None:
-            raise RuntimeError("OpenAI returned no structured normalization.")
+    provider = llm_provider if use_llm else "offline"
+    model_name = get_model_name(provider) if use_llm else ""
 
-        source = "openai"
+    cache_key = build_cache_key(
+        state, variable_name, description, field_type, provider, model_name
+    )
+    cache = load_cache()
+
+    if cache_key in cache:
+        record = cache[cache_key]
+        return (
+            NormalizedMetadata.model_validate(record["normalized"]),
+            record["normalization_source"],
+            True,
+        )
+
+    if not use_llm:
+        normalized = offline_normalization(variable_name, description, field_type)
+        source = "offline_fallback"
+    else:
+        user_prompt = build_user_prompt(state, variable_name, description, field_type)
+        if provider == "gemini":
+            normalized = call_gemini(user_prompt, model_name)
+        else:
+            normalized = call_openai(user_prompt, model_name)
+        source = provider
 
     cache[cache_key] = {
         "normalization_source": source,
