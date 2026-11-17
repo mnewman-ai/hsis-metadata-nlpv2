@@ -11,15 +11,9 @@ REVIEW_THRESHOLD = 0.70
 
 
 def build_embedding_text(file_name: str, normalized, field_type: str) -> str:
-    """One combined text per variable. Field_Type is context, not a filter."""
-    return (
-        f"File: {file_name}. "
-        f"Name: {normalized.standard_name}. "
-        f"Domain: {normalized.domain_category}. "
-        f"Description: {normalized.description}. "
-        f"Unit: {normalized.unit_type}. "
-        f"Field type: {field_type}."
-    )
+    """Name + description only. File is enforced by pairing; Field_Type is dropped."""
+    name = normalized.standard_name.replace("_", " ")
+    return f"{name}: {normalized.description}"
 
 
 def route(score: float, accept: float, review: float) -> str:

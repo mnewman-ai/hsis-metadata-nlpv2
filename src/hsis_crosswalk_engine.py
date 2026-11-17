@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pandas as pd
 
-from llm_normalizer import normalize_metadata
+from llm_normalizer import normalize_metadata_batch
 from pair_scorer import (
     ACCEPT_THRESHOLD,
     REVIEW_THRESHOLD,
@@ -38,26 +38,36 @@ def load_input(path: Path, exclude_states: list[str]) -> pd.DataFrame:
 
     return df.reset_index(drop=True)
 
-
 def normalize_all(df: pd.DataFrame, provider: str) -> pd.DataFrame:
-    """Run LLM (or offline) normalization on every row and build embedding text."""
-    use_llm = provider != "offline"
-    texts, sources = [], []
+    """Normalize rows and build their SBERT embedding text."""
+    records = df.to_dict("records")
+
+    normalized_results = normalize_metadata_batch(
+        records,
+        llm_provider=provider,
+    )
+
+    texts = []
+    sources = []
     total = len(df)
 
-    for n, row in enumerate(df.itertuples(index=False), start=1):
-        normalized, source, cache_hit = normalize_metadata(
-            row.State,
-            row.Variable_Name,
-            row.Description,
-            row.Field_Type,
-            use_llm=use_llm,
-            llm_provider=provider if use_llm else "gemini",
+    for number, (row, result) in enumerate(
+        zip(df.itertuples(index=False), normalized_results),
+        start=1,
+    ):
+        normalized, source, cache_hit = result
+
+        texts.append(
+            build_embedding_text(
+                row.File,
+                normalized,
+                row.Field_Type,
+            )
         )
-        texts.append(build_embedding_text(row.File, normalized, row.Field_Type))
         sources.append(source)
+
         print(
-            f"[{n}/{total}] {row.State}/{row.File}/{row.Variable_Name} "
+            f"[{number}/{total}] {row.State}/{row.File}/{row.Variable_Name} "
             f"({'cache' if cache_hit else source})"
         )
 
@@ -65,7 +75,6 @@ def normalize_all(df: pd.DataFrame, provider: str) -> pd.DataFrame:
     df["embedding_text"] = texts
     df["normalization_source"] = sources
     return df
-
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="HSIS cross-state metadata matcher")
