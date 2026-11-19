@@ -11,6 +11,7 @@ from llm_normalizer import build_cache_key, load_cache
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 INPUT = PROJECT_ROOT / "data" / "raw_states" / "hsis_raw_schema.csv"
 OUT_VARS = PROJECT_ROOT / "outputs" / "variable_normalizations.csv"
+OUT_NORMALIZATIONS_JSON = PROJECT_ROOT / "data" / "master_schema" / "variable_normalizations.json"
 OUT_MASTER = PROJECT_ROOT / "data" / "master_schema" / "hsis_master_concepts_draft.csv"
 
 
@@ -51,7 +52,13 @@ def main() -> None:
     vars_df = pd.DataFrame(records)
     OUT_VARS.parent.mkdir(parents=True, exist_ok=True)
     vars_df.to_csv(OUT_VARS, index=False)
-
+    vars_df.to_json(
+        OUT_NORMALIZATIONS_JSON,
+        orient="records",
+        indent=2,
+        force_ascii=False,
+    )
+    print(f"Wrote readable normalizations to {OUT_NORMALIZATIONS_JSON}")
     concepts = []
     for (file_name, name), g in vars_df.groupby(["File", "standard_name"]):
         concepts.append({
