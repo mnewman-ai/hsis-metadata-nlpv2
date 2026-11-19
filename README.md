@@ -1,5 +1,7 @@
 # HSIS Metadata Matcher
 
+THIS DESCRIPTION WAS WRITTEN BY AI
+
 Harmonizes variables across state DOT data dictionaries. Each variable is normalized by an LLM, embedded with SBERT, and compared by cosine similarity. The project has two parts:
 
 1. **Pairwise matching (built).** Compares variables across states within the same `File` and routes each pair to accepted, human review, or rejected.
