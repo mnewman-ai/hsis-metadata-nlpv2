@@ -177,4 +177,8 @@ Engine options:
 
 `file, state_a, variable_a, description_a, state_b, variable_b, description_b, text_a, text_b, cosine_similarity, decision, reviewer_status, reviewer_notes`
 
+<<<<<<< Updated upstream
 The v3 run scored about 92,900 pairs: 
+=======
+The v3 run scored about 92,900 pairs: 
+>>>>>>> Stashed changes
