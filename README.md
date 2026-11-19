@@ -1,61 +1,73 @@
 # HSIS Metadata Matcher
 
-Matches equivalent variables across state DOT data dictionaries. For each pair of states, it compares every variable in one state's file against every variable in the other state's file of the same type, scores the similarity, and sorts each pair into **accepted**, **human review**, or **rejected**.
+Harmonizes variables across state DOT data dictionaries. Each variable is normalized by an LLM, embedded with SBERT, and compared by cosine similarity. The project has two parts:
 
-This is a from-scratch rebuild of the earlier master-schema version: [hsis-metadata-nlp (archived)](https://github.com/tasnimhossenctr/hsis-metadata-nlp). That version matched each state to a fixed master schema. This version compares states directly.
+1. **Pairwise matching (built).** Compares variables across states within the same `File` and routes each pair to accepted, human review, or rejected.
+2. **Master concept list (in progress).** Groups equivalent variables into master concepts built from the normalized descriptions. The planned deliverables are `master_hsis_crosswalk_rules.csv` and `hitl_audit_queue.json`.
 
-## How it works
+This is a from-scratch rebuild of the earlier version: [hsis-metadata-nlp (archived)](https://github.com/tasnimhossenctr/hsis-metadata-nlp). That version matched variables to a hand-built master schema. This version has no master schema to start from, so it builds the master list from the data.
 
-1. **Input.** Read the raw data dictionary CSV.
-2. **Ingest and clean.** Validate columns, trim whitespace, drop blank and duplicate rows, and apply `--exclude_states`.
-3. **Check the cache.** If a variable was already normalized, reuse the saved result.
-4. **LLM normalization.** For uncached variables, an LLM (Gemini or OpenAI) returns a standard name, domain, description, and unit. `offline` mode skips the LLM.
-5. **Save to cache.** Each result is written to disk as it finishes, so interrupted runs resume where they stopped.
-6. **Build embedding text.** Each variable becomes `"<standard name>: <description>"`.
-7. **SBERT encoding.** `all-MiniLM-L6-v2` turns each text into a 384-dimensional vector.
-8. **Generate pairs.** Pairs form only within the same `File`, across every pair of different states.
-9. **Cosine similarity.** Score every pair.
-10. **Route by score.** Apply the thresholds below.
-11. **Export.** Write one CSV with a `decision` column.
-12. **Human review.** Reviewers check the `hitl_review` rows and fill in `reviewer_status` and `reviewer_notes`.
+## Pipeline
 
 ```mermaid
 flowchart TD
-    A[1. Raw data dictionary CSV] --> B[2. Ingest and clean]
-    B --> C{3. In cache?}
+    A[Raw data dictionary CSV] --> B[Ingest and clean]
+    B --> C{In cache?}
     C -- yes --> F
-    C -- no --> D[4. LLM normalization]
-    D --> E[5. Save to cache]
-    E --> F[6. Build embedding text]
-    F --> G[7. SBERT encoding]
-    G --> H[8. Same-File state pairs]
-    H --> I[9. Cosine similarity]
-    I --> J[10. Route by score]
-    J --> K[11. Export CSV]
-    K --> L[12. Human review]
+    C -- no --> D[Gemini batch normalization]
+    D --> E[Save to cache]
+    E --> F[Embedding text: name + description]
+    F --> G[SBERT encoding]
+    G --> H[Same-File state pairs]
+    H --> I[Cosine similarity]
+    I --> J[Route by score]
+    J --> K[Pairwise results CSV]
+    E --> M[Draft master concepts]
+    M --> N[Merge similar concepts]
+    N --> O[Review master list]
+    O --> P[Score variables vs. master list - planned]
+    P --> Q[master_hsis_crosswalk_rules.csv - planned]
+    P --> R[hitl_audit_queue.json - planned]
 ```
+
+### Part 1: Pairwise matching
+
+1. **Ingest.** Read the CSV, validate columns, trim whitespace, drop blank and duplicate rows, and apply `--exclude_states`.
+2. **Normalize.** Gemini (or OpenAI) returns `standard_name`, `domain_category`, `description`, and `unit_type` for each variable. Uncached variables are sent in batches of 10, and every result is cached.
+3. **Embed.** The text `"<standard name>: <description>"` is encoded with `all-MiniLM-L6-v2` into a 384-dimensional vector.
+4. **Pair.** Pairs form only within the same `File`, across every pair of different states.
+5. **Score and route.** Cosine similarity decides the bucket:
+
+   | Cosine similarity | Decision |
+   |---|---|
+   | >= 0.82 | `accepted` |
+   | 0.70 to < 0.82 | `hitl_review` |
+   | < 0.70 | `rejected` |
+
+6. **Export.** One CSV with a `decision` column.
+
+### Part 2: Master concepts
+
+1. **Draft list** (`src/build_master_concepts.py`). Reads the cache and groups variables that share an identical `standard_name` within a `File`. Writes `outputs/variable_normalizations.csv` and `data/master_schema/hsis_master_concepts_draft.csv`. It only works once every variable is cached (it reports how many are missing).
+2. **Merge** (`src/merge_master_concepts.py`). Clusters near-duplicate concepts by embedding similarity, within the same `File`. Writes `data/master_schema/hsis_master_concepts.csv` and `outputs/variable_concepts.csv`.
+3. **Review (manual).** Check the merged list before using it. Large clusters can mix different concepts.
+4. **Score against the master list (planned).** Compare each state variable to the reviewed concepts. At or above 0.82 goes to `master_hsis_crosswalk_rules.csv`. From 0.70 to below 0.82 goes to `hitl_audit_queue.json`. Below 0.70 is marked state-unique.
 
 ## Design rules
 
-- **Pairs stay within the same `File`.** Roadway variables are only compared with Roadway variables, and Crash with Crash. A state is never compared with itself.
-- **`Field_Type` is not a filter.** A Numeric field can still pair with a Coded one. It is also left out of the embedding text, because including it (along with the file name) made unrelated variables score too similarly.
-- **Routing thresholds:**
+- Pairs stay within the same `File`, and a state is never paired with itself.
+- `Field_Type` is not a filter, and it is not in the embedding text. Including it with the file name made unrelated variables score too similarly.
+- The thresholds (0.82 and 0.70) are the same in both parts.
+- Normalization results are cached by provider, so Gemini and OpenAI results never mix.
 
-  | Cosine similarity | Decision |
-  |---|---|
-  | >= 0.82 | `accepted` |
-  | 0.70 to < 0.82 | `hitl_review` |
-  | < 0.70 | `rejected` |
+## Data
 
-- **One entry point.** `src/hsis_crosswalk_engine.py` runs the whole pipeline.
-- **One results file.** A single CSV with a `decision` column replaces the old tiered crosswalk files.
+Input: `data/raw_states/hsis_raw_schema.csv`, about 1,520 variables from eight states across the `Roadway`, `Crash`, `Person`, and `Unit` files.
 
-## Input format
-
-The input CSV must have these columns:
+Columns:
 
 ```
-State,File,Variable_Name,Description,Field_Type
+Index,State,File,Variable_Name,Description,Field_Type
 ```
 
 Example:
@@ -65,7 +77,7 @@ WA,Roadway,SPEED_LIMIT,Posted Speed Limit,Numeric
 OH,Roadway,POSTED_SPEED_NBR,Speed Limit of Road,Numeric
 ```
 
-Save the file as UTF-8. A file saved from Excel may use a different encoding and fail with a `UnicodeDecodeError`. In Excel, choose "CSV UTF-8" when saving.
+Save the file as UTF-8 ("CSV UTF-8" in Excel). Other encodings fail with `UnicodeDecodeError`.
 
 ## Project layout
 
@@ -75,13 +87,16 @@ Save the file as UTF-8. A file saved from Excel may use a different encoding and
 ├── requirements.txt
 ├── .env.example
 ├── data/
-│   ├── raw_states/hsis_raw_schema.csv    # input
-│   └── cache/llm_normalizations.json     # LLM cache (gitignored)
+│   ├── raw_states/hsis_raw_schema.csv        # input
+│   ├── master_schema/                        # draft and merged master concepts
+│   └── cache/llm_normalizations.json         # LLM cache (gitignored)
 ├── src/
-│   ├── hsis_crosswalk_engine.py          # entry point
-│   ├── llm_normalizer.py                 # normalization, cache, Gemini/OpenAI
-│   └── pair_scorer.py                    # embedding, pairing, scoring, routing
-├── outputs/                              # results (gitignored)
+│   ├── hsis_crosswalk_engine.py              # pairwise entry point
+│   ├── llm_normalizer.py                     # normalization, batching, cache, Gemini/OpenAI
+│   ├── pair_scorer.py                        # embedding, pairing, scoring, routing
+│   ├── build_master_concepts.py              # draft master list from the cache
+│   └── merge_master_concepts.py              # cluster similar concepts
+├── outputs/                                  # results (gitignored)
 └── tests/
 ```
 
@@ -105,18 +120,46 @@ Set credentials as environment variables (Codespaces secrets or a local `.env`).
 
 ## Usage
 
+Normalize all variables and write the pairwise results:
+
 ```bash
-# Gemini (default)
-python src/hsis_crosswalk_engine.py --llm_provider gemini --exclude_states USAH USAN
-
-# OpenAI
-python src/hsis_crosswalk_engine.py --llm_provider openai
-
-# Offline, no API calls (plumbing test only; scores are less meaningful)
-python src/hsis_crosswalk_engine.py --llm_provider offline
+python src/hsis_crosswalk_engine.py --llm_provider gemini --output outputs/gemini_matches_v3.csv
 ```
 
-Options:
+Retry automatically after temporary errors (progress is cached, so each retry resumes):
+
+```bash
+unset GEMINI_MODEL
+for i in $(seq 1 30); do
+  python src/hsis_crosswalk_engine.py --llm_provider gemini --output outputs/gemini_matches_v3.csv && break
+  echo "Run failed (attempt $i of 30). Waiting 60 seconds..."
+  sleep 60
+done
+```
+
+Check how many variables still need normalizing:
+
+```bash
+python -c "
+import sys; sys.path.insert(0,'src')
+import pandas as pd
+from llm_normalizer import build_cache_key, load_cache
+df = pd.read_csv('data/raw_states/hsis_raw_schema.csv', dtype=str).fillna('').apply(lambda c: c.str.strip())
+df = df[df.Variable_Name!=''].drop_duplicates(['State','File','Variable_Name'])
+c = load_cache()
+left = sum(build_cache_key(r.State,r.Variable_Name,r.Description,r.Field_Type,'gemini','auto') not in c for r in df.itertuples())
+print(left, 'of', len(df), 'still need normalizing')
+"
+```
+
+Build the master concept list (requires `0 missing from cache`):
+
+```bash
+python src/build_master_concepts.py
+python src/merge_master_concepts.py
+```
+
+Engine options:
 
 | Flag | Default | Purpose |
 |---|---|---|
@@ -125,40 +168,13 @@ Options:
 | `--llm_provider` | `gemini` | `gemini`, `openai`, or `offline` |
 | `--accept` | `0.82` | Accepted threshold |
 | `--review` | `0.70` | HITL threshold |
-| `--exclude_states` | none | State codes to skip, such as `USAH USAN` |
-| `--min_score` | `0.0` | Drop pairs below this score from the output |
+| `--exclude_states` | none | State codes to skip |
+| `--min_score` | `0.0` | Drop pairs below this score |
 
 ## Output
 
-The results CSV has one row per candidate pair, sorted by score:
+**Pairwise results CSV** (one row per pair, sorted by score):
 
 `file, state_a, variable_a, description_a, state_b, variable_b, description_b, text_a, text_b, cosine_similarity, decision, reviewer_status, reviewer_notes`
 
-`decision` is `accepted`, `hitl_review`, or `rejected`. HITL rows start with `reviewer_status = pending`.
-
-## Gemini notes
-
-- **Model fallback.** Without `GEMINI_MODEL` set, the normalizer works down `GEMINI_MODEL_CHAIN` in `llm_normalizer.py` until a model responds, and prints which one it is using. Edit that list as models change.
-- **Rate limit.** The free tier allows about 15 requests per minute. A throttle spaces real API calls at least 5 seconds apart. Cache hits are not throttled.
-- **Large runs.** Uncached variables each cost one call, so about 1,500 variables take roughly two hours or more. Progress is cached, so rerunning the same command resumes where it stopped.
-- **503 errors.** These mean the model is overloaded. Wait and rerun the same command.
-- **Cache keys.** The key includes the provider, so Gemini and OpenAI results are never mixed. Gemini entries are stored under `"auto"`, and each record notes which model produced it.
-
-## Status and known limitations
-
-- Thresholds (0.82 and 0.70) are unchanged from the original design. They have only been spot-checked against a small answer key (about six pairs) and still need validation on a larger one.
-- Some obvious matches score just under 0.82 and land in HITL, such as `AADT` pairs described differently by the LLM.
-- Tests have not been written yet. The first should confirm that pairs never cross `File` and never pair a state with itself.
-- `config.yaml` is not implemented. Thresholds and the SBERT model name are constants in `pair_scorer.py`.
-- "Accepted" currently means any pair at or above 0.82. A variable can have several accepted partners in the same state. Choosing a single best match per variable is an open design question.
-- OpenAI support is in place but untested until credentials are available.
-
-## Troubleshooting
-
-| Problem | Fix |
-|---|---|
-| `Input is missing columns` | Check the CSV header matches the five columns above |
-| `UnicodeDecodeError` | Re-save the CSV as UTF-8 |
-| `429 RESOURCE_EXHAUSTED` | Rate limit. Wait about a minute and rerun |
-| `503 UNAVAILABLE` | Model overloaded. Wait and rerun, or `unset GEMINI_MODEL` to use the fallback chain |
-| `GEMINI_API_KEY is not set` | Add the secret, restart the Codespace, and confirm the secret is linked to this repo |
+The v3 run scored about 92,900 pairs: 
